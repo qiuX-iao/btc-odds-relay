@@ -23,9 +23,9 @@ on:
         description: 'ISO end (default: now)'
         required: false
       window:
-        description: 'window length'
+        description: 'window length (5m is the series still trading; see the Fetch step)'
         required: false
-        default: '15m'
+        default: '5m'
       slug_prefix:
         description: 'market slug prefix (default: btc-updown-<window>; use eth-updown-<window> for ETH)'
         required: false
@@ -66,37 +66,70 @@ jobs:
           [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           PREFIX="${{ inputs.slug_prefix || '' }}"
-          if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${{ inputs.window || '15m' }}"; fi
+          if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${{ inputs.window || '5m' }}"; fi
           node tools/fetch-polymarket-odds.mjs \
             --probe \
-            --window "${{ inputs.window || '15m' }}" \
+            --window "${{ inputs.window || '5m' }}" \
             --slug-prefix "$PREFIX" \
             --from "$SINCE" \
             --to "$UNTIL"
 
       - name: Fetch per-window odds
         run: |
-          set -euo pipefail
+          set -uo pipefail
           SINCE="${{ inputs.since || '' }}"
           UNTIL="${{ inputs.until || '' }}"
-          WINDOW="${{ inputs.window || '15m' }}"
-          PREFIX="${{ inputs.slug_prefix || '' }}"
-          if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${WINDOW}"; fi
           [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           STAMP="$(date -u '+%Y-%m-%dT%H%M%SZ')"
-          # Keep BTC and ETH runs in separate files -- the local puller merges every
-          # CSV it finds in data/relay and de-duplicates by windowStart, so two assets
-          # landing in one namespace would silently collide on the shared timestamp.
-          SAFE="$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9._-' '-')"
-          OUT="data/relay/${SAFE}-${WINDOW}-${STAMP}.csv"
-          echo "range: $SINCE .. $UNTIL (window $WINDOW, prefix $PREFIX)"
-          # Exits non-zero and writes NOTHING when zero rows resolve: a truncated
-          # file would read as "the market was only open sometimes".
-          node tools/fetch-polymarket-odds.mjs \
-            --from "$SINCE" --to "$UNTIL" --window "$WINDOW" --slug-prefix "$PREFIX" \
-            --out "$OUT"
-          echo "rows=$(wc -l < "$OUT")"
+
+          # A manual dispatch reads the ONE market asked for. The hourly schedule
+          # reads the two series this project actually consumes: 5m BTC (the paper
+          # bot) and 5m ETH (the reference account being reproduced).
+          #
+          # 5m, not 15m: measured 2026-09-28, a 6h sweep priced 1/71 five-minute
+          # windows and 0/24 fifteen-minute ones -- `no-market` for every other.
+          # The market only exists for windows near the present, so one relay run can
+          # only ever read the window in front of it. That is why this runs hourly and
+          # why it accumulates instead of back-filling.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PREFIXES="btc-updown-5m eth-updown-5m"
+          else
+            IN_WINDOW="${{ inputs.window || '' }}"
+            PREFIXES="${{ inputs.slug_prefix || '' }}"
+            [ -z "$PREFIXES" ] && PREFIXES="btc-updown-${IN_WINDOW:-5m}"
+          fi
+
+          # The file name keeps the `polymarket-odds-` prefix that
+          # tools/pull-relay-odds.mjs filters on, then the asset. One asset has to be
+          # pullable without the other: the local merge de-duplicates by windowStart
+          # and would silently collide BTC with ETH landing on the same timestamp.
+          priced=0
+          for PREFIX in $PREFIXES; do
+            WINDOW="${{ inputs.window || '' }}"
+            [ -z "$WINDOW" ] && WINDOW="${PREFIX##*-}"
+            ASSET="${PREFIX%%-*}"
+            OUT="data/relay/polymarket-odds-${ASSET}-${WINDOW}-${STAMP}.csv"
+            echo "--- $PREFIX | window $WINDOW | range $SINCE .. $UNTIL ---"
+            # Exits non-zero and writes NOTHING when zero rows resolve: a truncated
+            # file would read as "the market was only open sometimes".
+            if node tools/fetch-polymarket-odds.mjs \
+                 --from "$SINCE" --to "$UNTIL" --window "$WINDOW" --slug-prefix "$PREFIX" \
+                 --out "$OUT"; then
+              echo "rows=$(wc -l < "$OUT")"
+              priced=$((priced + 1))
+            else
+              echo "::warning::$PREFIX priced nothing in this range"
+            fi
+          done
+
+          # Fail only when EVERY series came back empty: a real upstream outage stays
+          # visible without one quiet series turning the whole job red.
+          if [ "$priced" -eq 0 ]; then
+            echo "no series priced anything -- failing so the miss stays visible"
+            exit 1
+          fi
+          echo "priced $priced series"
 
       # One file per run, rather than appending to one file: each fetch stays
       # independently auditable and a bad run cannot corrupt earlier history. The
