@@ -11,9 +11,20 @@ name: fetch-polymarket-odds
 
 on:
   schedule:
-    # Hourly at :17 UTC. Off the hour, deliberately: fewer ties with the quarter
-    # hour the 15m windows land on, and less contention for Actions runners.
-    - cron: '17 * * * *'
+    # Three slots an hour, at :07/:27/:47 UTC -- deliberately neither on the hour nor
+    # on the quarter hour the 15m windows land on.
+    #
+    # This used to be `17 * * * *`, and it never fired once. Measured 2026-09-28: the
+    # relay repo had 9 runs, every one `workflow_dispatch`, and `?event=schedule`
+    # returned 0 -- with the 11:17Z slot 39 minutes late and still empty. GitHub's
+    # scheduler is best-effort; a slot it drops is not deferred, it is gone.
+    #
+    # That costs more here than it would anywhere else. Polymarket only prices the
+    # window in front of it, so this job cannot back-fill: a missed slot is a window of
+    # real entry prices that no later run can recover. Three slots an hour make a miss
+    # cost 20 minutes instead of 60. Duplicates are free -- the pull side keys on
+    # windowStart and keeps the first row -- so the extra runs cannot corrupt anything.
+    - cron: '7,27,47 * * * *'
   workflow_dispatch:
     inputs:
       since:
@@ -83,15 +94,15 @@ jobs:
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           STAMP="$(date -u '+%Y-%m-%dT%H%M%SZ')"
 
-          # A manual dispatch reads the ONE market asked for. The hourly schedule
+          # A manual dispatch reads the ONE market asked for. The scheduled run
           # reads the two series this project actually consumes: 5m BTC (the paper
           # bot) and 5m ETH (the reference account being reproduced).
           #
           # 5m, not 15m: measured 2026-09-28, a 6h sweep priced 1/71 five-minute
           # windows and 0/24 fifteen-minute ones -- `no-market` for every other.
           # The market only exists for windows near the present, so one relay run can
-          # only ever read the window in front of it. That is why this runs hourly and
-          # why it accumulates instead of back-filling.
+          # only ever read the window in front of it. That is why this accumulates
+          # instead of back-filling, and why the cadence above is set that tight.
           if [ "${{ github.event_name }}" = "schedule" ]; then
             PREFIXES="btc-updown-5m eth-updown-5m"
           else
