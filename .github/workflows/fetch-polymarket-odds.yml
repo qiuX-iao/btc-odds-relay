@@ -26,6 +26,9 @@ on:
         description: 'window length'
         required: false
         default: '15m'
+      slug_prefix:
+        description: 'market slug prefix (default: btc-updown-<window>; use eth-updown-<window> for ETH)'
+        required: false
       probe:
         description: 'dump one window of raw JSON and stop'
         required: false
@@ -49,14 +52,27 @@ jobs:
 
       # Prove the upstream schema before trusting a batch. Cheap, and the only way
       # to notice Polymarket changed a field instead of silently pricing nothing.
+      #
+      # `--from`/`--to` take ISO 8601 or epoch ms ONLY -- the tool rejects relative
+      # strings like `now-24h` with exit 2. The defaults are therefore computed here
+      # in the shell. (They used to be the literal strings `now-24h`/`now`, which made
+      # every probe fail until someone finally dispatched it.)
       - name: Probe one window (optional)
         if: ${{ inputs.probe }}
         run: |
+          set -euo pipefail
+          SINCE="${{ inputs.since || '' }}"
+          UNTIL="${{ inputs.until || '' }}"
+          [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+          [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          PREFIX="${{ inputs.slug_prefix || '' }}"
+          if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${{ inputs.window || '15m' }}"; fi
           node tools/fetch-polymarket-odds.mjs \
             --probe \
             --window "${{ inputs.window || '15m' }}" \
-            --from "${{ inputs.since || 'now-24h' }}" \
-            --to "${{ inputs.until || 'now' }}"
+            --slug-prefix "$PREFIX" \
+            --from "$SINCE" \
+            --to "$UNTIL"
 
       - name: Fetch per-window odds
         run: |
@@ -64,15 +80,21 @@ jobs:
           SINCE="${{ inputs.since || '' }}"
           UNTIL="${{ inputs.until || '' }}"
           WINDOW="${{ inputs.window || '15m' }}"
+          PREFIX="${{ inputs.slug_prefix || '' }}"
+          if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${WINDOW}"; fi
           [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           STAMP="$(date -u '+%Y-%m-%dT%H%M%SZ')"
-          OUT="data/relay/polymarket-odds-${WINDOW}-${STAMP}.csv"
-          echo "range: $SINCE .. $UNTIL (window $WINDOW)"
+          # Keep BTC and ETH runs in separate files -- the local puller merges every
+          # CSV it finds in data/relay and de-duplicates by windowStart, so two assets
+          # landing in one namespace would silently collide on the shared timestamp.
+          SAFE="$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9._-' '-')"
+          OUT="data/relay/${SAFE}-${WINDOW}-${STAMP}.csv"
+          echo "range: $SINCE .. $UNTIL (window $WINDOW, prefix $PREFIX)"
           # Exits non-zero and writes NOTHING when zero rows resolve: a truncated
           # file would read as "the market was only open sometimes".
           node tools/fetch-polymarket-odds.mjs \
-            --from "$SINCE" --to "$UNTIL" --window "$WINDOW" \
+            --from "$SINCE" --to "$UNTIL" --window "$WINDOW" --slug-prefix "$PREFIX" \
             --out "$OUT"
           echo "rows=$(wc -l < "$OUT")"
 
