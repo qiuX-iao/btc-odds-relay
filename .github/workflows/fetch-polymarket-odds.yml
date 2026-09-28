@@ -11,24 +11,34 @@ name: fetch-polymarket-odds
 
 on:
   schedule:
-    # Three slots an hour, at :07/:27/:47 UTC -- deliberately neither on the hour nor
-    # on the quarter hour the 15m windows land on.
+    # Every 10 minutes, at :06/:16/:26/:36/:46/:56 UTC.
     #
-    # This used to be `17 * * * *`, and it never fired once. Measured 2026-09-28: the
-    # relay repo had 9 runs, every one `workflow_dispatch`, and `?event=schedule`
-    # returned 0 -- with the 11:17Z slot 39 minutes late and still empty. GitHub's
-    # scheduler is best-effort; a slot it drops is not deferred, it is gone.
+    # This was `17 * * * *` and it never fired once: measured 2026-09-28, the relay
+    # repo had 9 runs, every one `workflow_dispatch`, `?event=schedule` returned 0, and
+    # the 11:17Z slot was 39 minutes late and still empty. GitHub's scheduler is
+    # best-effort -- a slot it drops is not deferred, it is gone.
     #
-    # That costs more here than it would anywhere else. Polymarket only prices the
-    # window in front of it, so this job cannot back-fill: a missed slot is a window of
-    # real entry prices that no later run can recover. Three slots an hour make a miss
-    # cost 20 minutes instead of 60. Duplicates are free -- the pull side keys on
-    # windowStart and keeps the first row -- so the extra runs cannot corrupt anything.
-    - cron: '7,27,47 * * * *'
+    # WHY DENSITY, NOT JUST RELIABILITY. Measured over 10 runs on 2026-09-28, a sweep
+    # prices ONLY the last one or two windows it enumerates (13:36Z run -> 13:30Z
+    # window; 13:40:54Z run -> 13:35Z and 13:30Z). The other ~69 windows come back
+    # `no-market`: Polymarket delists a 5m updown market minutes after it settles, so a
+    # window is readable only for roughly its first 5-11 minutes. The enumerated range
+    # ends at `floor5(now) - 5m`, i.e. the freshest window is always 5-10 minutes old --
+    # inside that band, but with little margin, which is why a single hourly slot either
+    # catches one window or catches none.
+    #
+    # So cadence IS the yield: one run/hour buys 0-2 windows/hour. `*/10` gives every
+    # window a run at age ~6 minutes (the freshest this geometry allows), i.e. ~6
+    # windows/hour instead of ~1.
+    #
+    # `:06` and not `:05`: the range end is `floor5(until) - 5m`, so minute ≡ 0 mod 5
+    # sits exactly on a window boundary and an off-by-one in close-time handling would
+    # silently cost the window. Minute ≡ 1 mod 5 is one minute of deliberate slack.
+    - cron: '6,16,26,36,46,56 * * * *'
   workflow_dispatch:
     inputs:
       since:
-        description: 'ISO start (default: 6 hours ago)'
+        description: 'ISO start (default: 20 minutes ago -- older windows have no market left)'
         required: false
       until:
         description: 'ISO end (default: now)'
@@ -48,6 +58,15 @@ on:
 
 permissions:
   contents: write
+
+# Serialize runs. Every run ends in `git push` to the same branch, and the schedule is
+# now dense enough (every 10 minutes) that a delayed slot can overlap the next one --
+# two concurrent jobs is exactly the non-fast-forward race that turned 3 of the first 7
+# relay runs red. Queued, not cancelled: a run that is already fetching holds the only
+# copy of that window's price, and a later run cannot recover it.
+concurrency:
+  group: relay-odds
+  cancel-in-progress: false
 
 jobs:
   fetch:
@@ -74,7 +93,7 @@ jobs:
           set -euo pipefail
           SINCE="${{ inputs.since || '' }}"
           UNTIL="${{ inputs.until || '' }}"
-          [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+          [ -z "$SINCE" ] && SINCE="$(date -u -d '-20 minutes' '+%Y-%m-%dT%H:%M:%SZ')"
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           PREFIX="${{ inputs.slug_prefix || '' }}"
           if [ -z "$PREFIX" ]; then PREFIX="btc-updown-${{ inputs.window || '5m' }}"; fi
@@ -88,9 +107,22 @@ jobs:
       - name: Fetch per-window odds
         run: |
           set -uo pipefail
+          # 20 minutes, not 6 hours. Measured 2026-09-28 over 10 runs: a 6h sweep issues
+          # 71 upstream requests and prices at most the LAST one or two windows in that
+          # list -- 13:36Z run -> 13:30Z window, 13:40:54Z run -> 13:35Z and 13:30Z.
+          # Every older window answers `no-market`, because Polymarket delists a 5m
+          # updown market minutes after it settles. The other 69 requests buy nothing.
+          #
+          # That is not just waste, it is a cost: 4-at-a-time over 71 windows is heavy
+          # enough that a burst of runs can start coming back all-`no-market` (observed
+          # on 13:42:59Z after a manual test burst). `no-market` conflates "absent" with
+          # "gamma refused us" -- tools/fetch-polymarket-odds.mjs records the per-window
+          # detail (`gamma HTTP 429`) but the summary line only prints the reason count,
+          # so a throttled sweep is indistinguishable from a quiet market. Asking for 4
+          # windows instead of 71 keeps us away from that edge.
           SINCE="${{ inputs.since || '' }}"
           UNTIL="${{ inputs.until || '' }}"
-          [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+          [ -z "$SINCE" ] && SINCE="$(date -u -d '-20 minutes' '+%Y-%m-%dT%H:%M:%SZ')"
           [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           STAMP="$(date -u '+%Y-%m-%dT%H%M%SZ')"
 
@@ -98,11 +130,10 @@ jobs:
           # reads the two series this project actually consumes: 5m BTC (the paper
           # bot) and 5m ETH (the reference account being reproduced).
           #
-          # 5m, not 15m: measured 2026-09-28, a 6h sweep priced 1/71 five-minute
-          # windows and 0/24 fifteen-minute ones -- `no-market` for every other.
-          # The market only exists for windows near the present, so one relay run can
-          # only ever read the window in front of it. That is why this accumulates
-          # instead of back-filling, and why the cadence above is set that tight.
+          # 5m, not 15m: measured 2026-09-28, a sweep priced 1/71 five-minute windows
+          # and 0/24 fifteen-minute ones -- `no-market` for every other. The market only
+          # exists for windows near the present, so one run can only read the window in
+          # front of it. That is why this accumulates instead of back-filling.
           if [ "${{ github.event_name }}" = "schedule" ]; then
             PREFIXES="btc-updown-5m eth-updown-5m"
           else
