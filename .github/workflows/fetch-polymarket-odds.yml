@@ -1,0 +1,93 @@
+name: fetch-polymarket-odds
+
+# A relay, not a workaround: this project cannot generate its own entry prices, and
+# the machine the bot runs on cannot reach Polymarket. GitHub's runners can, so they
+# run the SAME tool (`tools/fetch-polymarket-odds.mjs`) and commit the CSV; the local
+# side pulls it over `raw.githubusercontent.com`, which this machine CAN reach.
+#
+# Nothing here changes the data's meaning: the remote writes rows, nothing else. Use
+# `tools/pull-relay-odds.mjs` locally, then ALWAYS validate with `odds-check` before
+# trusting any number that came out of it.
+
+on:
+  schedule:
+    # Hourly at :17 UTC. Off the hour, deliberately: fewer ties with the quarter
+    # hour the 15m windows land on, and less contention for Actions runners.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'ISO start (default: 6 hours ago)'
+        required: false
+      until:
+        description: 'ISO end (default: now)'
+        required: false
+      window:
+        description: 'window length'
+        required: false
+        default: '15m'
+      probe:
+        description: 'dump one window of raw JSON and stop'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # No `npm ci`: the tool is dependency-free on purpose, and a cache would
+          # only add a moving part to a job whose whole job is being reliable.
+
+      # Prove the upstream schema before trusting a batch. Cheap, and the only way
+      # to notice Polymarket changed a field instead of silently pricing nothing.
+      - name: Probe one window (optional)
+        if: ${{ inputs.probe }}
+        run: |
+          node tools/fetch-polymarket-odds.mjs \
+            --probe \
+            --window "${{ inputs.window || '15m' }}" \
+            --from "${{ inputs.since || 'now-24h' }}" \
+            --to "${{ inputs.until || 'now' }}"
+
+      - name: Fetch per-window odds
+        run: |
+          set -euo pipefail
+          SINCE="${{ inputs.since || '' }}"
+          UNTIL="${{ inputs.until || '' }}"
+          WINDOW="${{ inputs.window || '15m' }}"
+          [ -z "$SINCE" ] && SINCE="$(date -u -d '-6 hours' '+%Y-%m-%dT%H:%M:%SZ')"
+          [ -z "$UNTIL" ] && UNTIL="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          STAMP="$(date -u '+%Y-%m-%dT%H%M%SZ')"
+          OUT="data/relay/polymarket-odds-${WINDOW}-${STAMP}.csv"
+          echo "range: $SINCE .. $UNTIL (window $WINDOW)"
+          # Exits non-zero and writes NOTHING when zero rows resolve: a truncated
+          # file would read as "the market was only open sometimes".
+          node tools/fetch-polymarket-odds.mjs \
+            --from "$SINCE" --to "$UNTIL" --window "$WINDOW" \
+            --out "$OUT"
+          echo "rows=$(wc -l < "$OUT")"
+
+      # One file per run, rather than appending to one file: each fetch stays
+      # independently auditable and a bad run cannot corrupt earlier history. The
+      # local `pull-relay-odds.mjs` merges whichever files it finds.
+      - name: Commit any new file
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain data/relay)" ]; then
+            echo "no new rows to commit"
+            exit 0
+          fi
+          git config user.name  "polymarket-odds relay"
+          git config user.email "relay@example.invalid"
+          git add data/relay
+          git commit -m "relay: polymarket odds $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          git push
